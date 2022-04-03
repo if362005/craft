@@ -1,0 +1,4 @@
+auto
+craft_tests.out
+craft_tests.err
+*.log

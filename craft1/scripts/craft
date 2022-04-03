@@ -1,0 +1,220 @@
+#!/usr/bin/env ruby
+#
+# craft
+#
+# Generate floating-point precision configurations for a target application and
+# test them. Assemble a final recommended configuration.
+#
+# Copyright (C) 2019 Mike Lam, UMD/JMU/LLNL
+# Original version written October 2012
+#
+
+# needed for opening stderr as well as stdin/stdout
+# when spawning new system processes
+require 'open3'
+
+# needed for object serialization
+require 'yaml'
+
+# needed for file manipulation and directory removal
+require 'fileutils'
+
+# needed for inter-tool JSON parsing and generating
+require 'json'
+
+# needed for quick set membership checking
+require 'set'
+
+# global constants
+require_relative 'craft_consts'
+
+# data structures
+require_relative 'craft_structs'
+
+# search strategy routines
+require_relative 'craft_strategies'
+
+# search management routines
+require_relative 'craft_manage'
+
+# file I/O routines
+require_relative 'craft_filemanip'
+
+# helper routines
+require_relative 'craft_helpers'
+
+$CRAFT_VERSION = "1.2"
+
+# app entry point
+def main
+    srand
+
+    # initialize global variables
+    $search_tag = "craft"                   # filename tag
+    $search_path = Dir.getwd + "/"          # working folder
+    $craft_builder = "craft_builder"        # standard builder program name
+    $craft_driver = "craft_driver"          # standard driver program name
+    $craft_run = "craft_run"                # configuration run script (generated)
+    $craft_output = "craft.log"             # standard driver output file name
+    $binary_name = ""                       # prevents crashes if there is no binary (e.g., in variable mode)
+    $status_preferred = $STATUS_SINGLE      # preferred replacement status
+    $status_alternate = $STATUS_DOUBLE      # replacement status if cannot be preferred
+    $status_blank = " "                     # "no result" replacement status
+    $fortran_mode = false                   # pass "-N" to mutator
+    $variable_mode = false                  # use source-to-source to generate program variants
+    $base_type = $TYPE_INSTRUCTION          # stop splitting configs at this level
+    $skip_nonexecuted = true                # don't bother running configs with non-executed instructions
+    $mixed_use_rprec = false                # use rprec 23-bit truncation to simulate mixed svinp analysis
+    $rprec_split_threshold = 23             # config splitting threshold for reduced precision searches
+    $rprec_runtime_pct_threshold = 0.0      # config cutoff runtime percentage threshold
+    $rprec_skip_app_level = false           # skip the app level for rprec search
+    $initial_cfg_fn = ""                    # initial config filename (may be blank)
+    $addt_cfg_fns = []                      # additional configuration files (may be empty)
+    $prof_log_fn = ""                       # initial profiling log (may be blank)
+    $max_queue_length = 0                   # track largest queue size (approximate)
+    $main_mode = "start"                    # main status ("start/search", "resume", "status", "clean", "help")
+    $resume_lower = false                   # resume at a lower level
+    $max_inproc = 1                         # maximum number of concurrent in-process tests (-1 to remove cap)
+    $strategy_name = "bin_simple"           # desired search strategy
+    $self_invoke = File.basename($0)        # used for help text
+    $fpconf_invoke = "fpconf"               # invoke configuration generator
+    $fpconf_options = "-c --svinp double"   # configuration generator options
+    $fpinst_invoke = "fpinst"               # invoke mutator
+    $binary_serialization = true            # use binary serialization (faster) for queues instead of YAML
+    $disable_queue_sort = false             # disable workqueue sorting
+    $num_trials = 1                         # default number of trials
+    $keep_all_runs = false                  # don't keep temporary files
+    $group_by_labels = []                   # group by labels (variable mode only)
+    $merge_overlapping_groups = false       # merge overlapping groups (variable mode only)
+    $job_mode = "exec"                      # how to submit jobs ("exec", "slurm")
+    $timeout_limit = nil                    # cancel tests after this many seconds (1.5x baseline by default)
+
+    # plain text info files
+    $settings_fn = "#{$search_path}#{$search_tag}.settings"
+    $program_fn = "#{$search_path}#{$search_tag}.program"
+    $mainlog_fn = "#{$search_path}#{$search_tag}.mainlog"
+    $walltime_fn = "#{$search_path}#{$search_tag}.walltime"
+
+    # main data structures (files just contain lists of AppConfig objects)
+    $workqueue = []                                               # ordered list of AppConfigs
+    $workqueue_lookup = Hash.new                                  # map: cuid => AppConfig (for quicker lookups and membership testing)
+    $workqueue_fn = "#{$search_path}#{$search_tag}.workqueue"     #   waiting to be tested
+    $inproc = Hash.new                                            # map: cuid => AppConfig
+    $inproc_fn = "#{$search_path}#{$search_tag}.inproc"           #   currently running
+    $tested = Hash.new                                            # map: cuid => AppConfig
+    $tested_fn = "#{$search_path}#{$search_tag}.tested"           #   finished (passed, failed, or aborted)
+
+    # configuration file directories
+    $perf_path     = "#{$search_path}baseline/"    # baseline performance test
+    $prof_path     = "#{$search_path}profile/"     # profiler run
+    $run_path      = "#{$search_path}run/"         # work folders for runs
+    $final_path    = "#{$search_path}final/"       # single final "best" config (cfg file + mutant)
+    $best_path     = "#{$search_path}best/"        # top 10 "best" individual configs (cfg files only)
+    $passed_path   = "#{$search_path}passed/"      # all successful configs (cfg files only)
+    $failed_path   = "#{$search_path}failed/"      # all failed configs (cfg files only)
+    $aborted_path  = "#{$search_path}aborted/"     # all aborted configs (cfg files only)
+    $snapshot_path = "#{$search_path}snapshots/"   # status printouts
+
+    # short-circuit: version text
+    if ARGV.include?("-v") or ARGV.include?("--version") then
+        puts "CRAFT #{$CRAFT_VERSION}"
+        exit
+    end
+
+    # short-circuit: help text
+    if ARGV.size == 0 or ARGV[0] == "help" or ARGV.include?("-h") or ARGV.include?("--help") then
+        $main_mode = "help"
+        print_usage
+        exit
+    end
+
+    # read search options
+    parse_command_line
+    if $main_mode == "resume" or $main_mode == "status" then
+        if not File.exists?($settings_fn) then
+            puts "No search detected in current folder"
+            exit
+        end
+        load_settings
+    end
+
+    # important single configuration files (must be initialized after loading
+    # settings to ascertain correct extension)
+    $orig_config_fn  = "#{$search_path}#{$search_tag}_orig.#{ $variable_mode ? "json" : "cfg"}"
+    $final_config_fn = "#{$search_path}#{$search_tag}_final.#{$variable_mode ? "json" : "cfg"}"
+
+    if $main_mode == "status" then
+        load_data_structures
+        print_status
+        exit
+    end
+
+    # cleaning mode
+    if $main_mode == "clean" then
+        puts "Cleaning..."
+        clean_everything
+        puts "Done."
+        exit
+    end
+
+    # check for builder and driver scripts
+    if $variable_mode and !File.exist?("#{$search_path}#{$craft_builder}") then
+        puts "No driver program \"craft_builder\" found."
+        puts "Aborting."
+        exit
+    end
+    if !File.exist?("#{$search_path}#{$craft_driver}") then
+        puts "No driver program \"craft_driver\" found."
+        puts "Aborting."
+        exit
+    end
+
+    puts ""
+    puts "CRAFT #{$CRAFT_VERSION}"
+    puts "Executable:  #{$binary_name}" unless $variable_mode
+    puts "Working dir: #{$search_path}"
+    puts ""
+
+    if $main_mode == "start" then
+        # this is the first invocation of this analysis; initialize everything
+        initialize_search
+    else
+        # we're resuming an analysis
+        puts "Resuming in-process search ..."
+        if File.exist?($final_path) then
+            # clear out any final configuration testing
+            FileUtils.rm_rf($final_path)
+        end
+        if File.exist?($walltime_fn) then
+            # previous search was completed; restart wall timer
+            $start_time = Time.now
+            FileUtils.rm_rf($walltime_fn)
+        end
+        initialize_program
+        read_profiler_data
+        load_data_structures
+        initialize_strategy
+        move_all_inproc_to_workqueue
+        if $resume_lower then
+            resume_lower_search
+            save_settings
+        end
+    end
+
+    # main loop
+    puts "Initialization complete. Starting main search routine with #{get_workqueue_length} configuration(s) in the queue."
+    puts ""
+    if $strategy.has_custom_supervisor? then
+        $strategy.run_custom_supervisor
+    else
+        run_main_search_loop
+    end
+
+    # test final config, assemble results, etc.
+    finalize_search
+
+end
+
+# top-level: call main
+main
+

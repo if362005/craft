@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+#
+# Runs viewer UI with a few supported command-line parameters.
+# (Basically just a wrapper for launching the JAR file)
+#
+
+BACKGROUND="y"
+
+for p in $@; do
+    if [ "$p" = "-c" ]; then
+        BACKGROUND="n"
+    fi
+    if [ "$p" = "-i" ]; then
+        BACKGROUND="n"
+    fi
+    if [ "$p" = "-s" ]; then
+        BACKGROUND="n"
+    fi
+done
+
+# get the path of this script, regardless of any symlinks
+#   (from https://stackoverflow.com/a/246128)
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_PATH="$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )"
+
+if [ "$BACKGROUND" = "y" ]; then
+    java -Xmx1024M -jar $SCRIPT_PATH/../viewer/fpview.jar $@ &
+else
+    java -Xmx1024M -jar $SCRIPT_PATH/../viewer/fpview.jar $@
+fi
+

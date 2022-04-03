@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+#
+# SAMPLE DRIVER SCRIPT (source/variable mode)
+#
+
+EXE_NAME="your_exe"
+TMP_FILE=stdout.tmp
+
+# run compiled program w/ timer and save output
+t_start=$(date +%s.%3N)
+
+# MODIFY THIS: run binary
+./${EXE_NAME} >"${TMP_FILE}"
+exit_code=$?
+
+# stop timing
+t_stop=$(date +%s.%3N)
+
+# calculate runtime
+runtime=$(echo "$t_stop - $t_start" | bc)
+
+# MODIFY THIS: check verification
+status="pass"
+if [ $exit_code -ne 0 ]; then
+    status="error"
+else
+    check=$(grep "[^N]SUCCESSFUL" $tmp_file)
+    if [ -z "$check" ]; then
+        status="fail"
+    fi
+fi
+
+# MODIFY THIS: calculate error
+error="0.0e0"
+
+# output
+echo "status:  $status"
+echo "time:    $runtime"
+echo "error:   $error"
+
+# cleanup
+rm -f "${TMP_FILE}"
+
